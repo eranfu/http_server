@@ -7,3 +7,6 @@ edition = "2018"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
+async-std = { version = "1.7.0", features = ["attributes"] }
+async-listen = "0.2.1"
+futures = "0.3.8"

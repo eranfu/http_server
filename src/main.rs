@@ -1,42 +1,72 @@
-use std::fs;
-use std::io::prelude::*;
-use std::net::TcpListener;
-use std::net::TcpStream;
+use std::future::Future;
+use std::time::Duration;
 
-fn main() {
-    // Listen for incoming TCP connections on localhost port 7878
-    let listener = TcpListener::bind("127.0.0.1:7878").unwrap();
+use async_listen::backpressure::Token;
+use async_listen::ListenExt;
+use async_std::fs;
+use async_std::io::BufReader;
+use async_std::net::{TcpListener, TcpStream};
+use async_std::task;
+use async_std::task::JoinHandle;
+use futures::{AsyncBufReadExt, AsyncWriteExt, StreamExt};
 
-    // Block forever, handling each request that arrives at this IP address
-    for stream in listener.incoming() {
-        let stream = stream.unwrap();
+type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
-        handle_connection(stream);
+#[async_std::main]
+async fn main() -> Result<()> {
+    let listener = TcpListener::bind("0.0.0.0:7878").await?;
+    listener
+        .incoming()
+        .log_warnings(log_warnings)
+        .handle_errors(Duration::from_millis(500))
+        .backpressure(100)
+        .for_each(|(token, stream)| async move {
+            spawn_and_log_error(handle_connection(token, stream));
+        })
+        .await;
+
+    Ok(())
+}
+
+async fn await_and_log_error(fut: impl Future<Output = Result<()>>) {
+    if let Err(e) = fut.await {
+        eprintln!("{}", e);
     }
 }
 
-fn handle_connection(mut stream: TcpStream) {
-    // Read the first 1024 bytes of data from the stream
-    let mut buffer = [0; 1024];
-    stream.read(&mut buffer).unwrap();
+fn spawn_and_log_error(fut: impl 'static + Future<Output = Result<()>> + Send) -> JoinHandle<()> {
+    task::spawn(await_and_log_error(fut))
+}
 
-    let get = b"GET / HTTP/1.1\r\n";
+fn log_warnings(error: &std::io::Error) {
+    eprintln!("Error: {}. Listener paused for 0.5s", error);
+}
+
+async fn handle_connection(_token: Token, mut stream: TcpStream) -> Result<()> {
+    let stream_reader = BufReader::new(&stream);
+    let mut lines = stream_reader.lines();
+    let request_line = match lines.next().await {
+        None => Err("peer disconnected immediately.")?,
+        Some(line) => line?,
+    };
+
+    const INDEX_PATTERN: &str = "GET / HTTP/1.1";
+    const SLEEP_PATTERN: &str = "GET /sleep HTTP/1.1";
 
     // Respond with greetings or a 404,
     // depending on the data in the request
-    let (status_line, filename) = if buffer.starts_with(get) {
-        ("HTTP/1.1 200 OK\r\n\r\n", "resources/web_root/hello.html")
+    let (status_line, res_file_path) = if request_line.eq(INDEX_PATTERN) {
+        ("HTTP/1.1 200 OK", "resources/web_root/hello.html")
+    } else if request_line.eq(SLEEP_PATTERN) {
+        task::sleep(Duration::from_secs(5)).await;
+        ("HTTP/1.1 200 OK", "resources/web_root/hello.html")
     } else {
-        (
-            "HTTP/1.1 404 NOT FOUND\r\n\r\n",
-            "resources/web_root/404.html",
-        )
+        ("HTTP/1.1 404 NOT FOUND", "resources/web_root/404.html")
     };
-    let contents = fs::read_to_string(filename).unwrap();
+    let contents = fs::read_to_string(res_file_path).await?;
+    stream.write_all(status_line.as_bytes()).await?;
+    stream.write_all("\r\n\r\n".as_bytes()).await?;
+    stream.write_all(contents.as_bytes()).await?;
 
-    // Write response back to the stream,
-    // and flush the stream to ensure the response is sent back to the client
-    let response = format!("{}{}", status_line, contents);
-    stream.write(response.as_bytes()).unwrap();
-    stream.flush().unwrap();
+    Ok(())
 }
